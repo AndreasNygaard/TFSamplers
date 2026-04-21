@@ -64,7 +64,10 @@ class Sampler:
                bounds=None,
                num_burnin_steps=100,
                num_covmat_updates=3,
-               sampler_kwargs={}):
+               update_initial_state=True,
+               update_initial_distribution=True,
+               sampler_kwargs={},
+               burnin_kwargs={}):
 
         if num_covmat_updates > 0 and num_burnin_steps == 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
@@ -77,48 +80,66 @@ class Sampler:
         if method == 'affine':
             num_burnin_steps = 0  # Affine-invariant sampler doesn't use burn-in
             num_covmat_updates = 0  # Affine-invariant sampler doesn't update covariance
-            sample_fn = lambda steps, covmat: run_affine(self.log_prob_fn,
-                                                         self.initial_state,
-                                                         n_steps=steps)
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_affine(self.log_prob_fn,
+                                                                                        initial_state,
+                                                                                        n_steps=steps,
+                                                                                        **sampler_kwargs)
         elif method == 'hmc':
-            sample_fn = lambda steps, covmat: run_hmc(self.log_prob_fn,
-                                                      self.initial_state,
-                                                      n_steps=steps,
-                                                      covmat=covmat,
-                                                      **sampler_kwargs)
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_hmc(self.log_prob_fn,
+                                                                                     initial_state,
+                                                                                     n_steps=steps,
+                                                                                     covmat=covmat,
+                                                                                     **sampler_kwargs)
         elif method == 'nuts':
-            sample_fn = lambda steps, covmat: run_nuts(self.log_prob_fn,
-                                                       self.initial_state,
-                                                       n_steps=steps,
-                                                       covmat=covmat,
-                                                       **sampler_kwargs)
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_nuts(self.log_prob_fn,
+                                                                                      initial_state,
+                                                                                      n_steps=steps,
+                                                                                      covmat=covmat,
+                                                                                      **sampler_kwargs)
         elif method == 'mchmc':
-            sample_fn = lambda steps, covmat: run_mchmc(self.log_prob_fn,
-                                                        self.initial_state,
-                                                        n_steps=steps,
-                                                        scales=tf.sqrt(tf.linalg.diag_part(covmat)),
-                                                        **sampler_kwargs)
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mchmc(self.log_prob_fn,
+                                                                                       initial_state,
+                                                                                       n_steps=steps,
+                                                                                       scales=covmat,
+                                                                                       **sampler_kwargs)
         elif method == 'mala':
-            sample_fn = lambda steps, covmat: run_mala(self.log_prob_fn,
-                                                       self.initial_state,
-                                                       n_steps=steps,
-                                                       covmat=covmat,
-                                                       **sampler_kwargs)
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mala(self.log_prob_fn,
+                                                                                      initial_state,
+                                                                                      n_steps=steps,
+                                                                                      covmat=covmat,
+                                                                                      **sampler_kwargs)
         else:
             raise ValueError("Invalid sampling method. Must be 'affine', 'hmc', 'nuts', 'mchmc', or 'mala'.")
         covmat_estimate = self.ini_covmat
+        burnin_sampler_kwargs = sampler_kwargs.copy()
+        burnin_sampler_kwargs.update(burnin_kwargs)
         burnin_samples = []
         burnin_acceptance_rates = []
         burnin_evaluations = []
         for i in range(num_covmat_updates):
             print(f"Estimatingcovariance matrix, iteration {i+1}/{num_covmat_updates}...")
-            samples, acceptance_rate, evaluations = sample_fn(num_burnin_steps, covmat_estimate)
+            samples, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
             burnin_samples.append(samples)
             burnin_acceptance_rates.append(acceptance_rate)
             burnin_evaluations.append(evaluations)
             covmat_estimate = tfp.stats.covariance(samples)
+            L = tf.linalg.cholesky(covmat_estimate)
+            covmat_estimate = tf.matmul(L, L, transpose_b=True)  # Ensure covariance matrix is positive definite
+            bestfit_estimate = tf.reduce_mean(samples, axis=0)
+            if tf.math.reduce_any(tf.math.is_nan(covmat_estimate)) or tf.math.reduce_any(tf.math.is_inf(covmat_estimate)):
+                raise ValueError("Covariance matrix estimate contains NaNs or Infs. Use an initial state closer to the mode or use method='affine' instead to get a better initial state and covariance estimate.")
+
+            if update_initial_state and initial_distribution != 'uniform' and len(initial_state.shape) == 1:
+                if update_initial_distribution:
+                    initial_distribution = 'gaussian'
+                self.set_initial_state(bestfit_estimate,
+                                       n_chains=n_chains,
+                                       initial_distribution=initial_distribution,
+                                       bounds=bounds,
+                                       covmat=covmat_estimate)
+
         print("Running final sampling...")
-        samples, acceptance_rate, evaluations = sample_fn(n_steps, covmat_estimate)
+        samples, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
 
         sampler_results = SamplerResults(samples, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
@@ -134,7 +155,7 @@ class Sampler:
             factor = 10000/scales
             below = factor*tf.exp(self.lower_bounds - x)      # penalty if below lower bound
             above = factor*tf.exp(x - self.upper_bounds)      # penalty if above upper bound
-            inside = tf.zeros_like(x)      # inside the box: uniform
+            inside = tf.zeros_like(x)                         # inside the box: uniform
             log_prob = tf.where(x < self.lower_bounds, -below,
                                 tf.where(x > self.upper_bounds, -above, inside))
             return tf.reduce_sum(log_prob, axis=-1)
@@ -168,7 +189,7 @@ class Sampler:
         if overwrite_log_prob_fn:
             self.log_prob_fn = self.create_bounded_log_prob_fn(self.log_prob_no_bounds)
 
-    def set_initial_state(self, initial_state, n_chains=10, initial_distribution='repeat', bounds=None):
+    def set_initial_state(self, initial_state, n_chains=10, initial_distribution='repeat', bounds=None, covmat=None):
         if isinstance(initial_state, list) and len(initial_state) > 2:
             initial_state = tf.convert_to_tensor(initial_state, dtype=tf.float32)
         elif isinstance(initial_state, np.ndarray) and len(initial_state.shape) > 2:
@@ -216,7 +237,12 @@ class Sampler:
                     bounds = np.array([self.lower_bounds.numpy(), self.upper_bounds.numpy()]).T
                 else:
                     bounds = None
-                dist = HypersphereSampler(initial_state.shape[0], limits=bounds, covmat=self.ini_covmat.numpy())
+                if covmat is None:
+                    covmat = self.ini_covmat
+                dist = HypersphereSampler(initial_state.shape[0],
+                                          limits=bounds,
+                                          covmat=covmat.numpy(),
+                                          centers=initial_state.numpy())
                 initial_state = tf.convert_to_tensor(dist.sample(n_chains), dtype=tf.float32)
             elif initial_distribution == 'uniform':
                 if bounds is not None:

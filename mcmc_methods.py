@@ -106,7 +106,7 @@ def run_hmc(log_prob_fn,
     )
     adaptive_hmc = tfp.mcmc.SimpleStepSizeAdaptation(
         inner_kernel = hcm_kernel,
-        num_adaptation_steps=int(0.8 * num_burnin_steps) if num_adaptation_steps is None else num_adaptation_steps,
+        num_adaptation_steps=num_burnin_steps if num_adaptation_steps is None else num_adaptation_steps,
     )
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
@@ -259,13 +259,15 @@ def mchmc_step(model, q, p, dt=1e-3):
 
     return q_new, p_new, dt*p_half
 
-
+@tf.function
 def kinetic_energy(p):
     return 0.5 * tf.reduce_sum(p * p, axis=-1)
 
+@tf.function
 def potential_energy(q, log_prob_fn):
     return -log_prob_fn(q)  # shape (num_chains,)
 
+@tf.function
 def hamiltonian(q, p, log_prob_fn):
     return potential_energy(q, log_prob_fn) + kinetic_energy(p)
 
@@ -275,6 +277,10 @@ def run_mchmc(log_prob_fn,
               scales=None,
               num_leapfrog=10,
               step_size=0.1,
+              num_burnin_steps=0,
+              target_accept=0.7,
+              stepsize_adaptation_leapfrog_penalty=0.4,
+              ignore_warnings=False,
               n_chains=50,
               progress_bar=True):
 
@@ -292,6 +298,17 @@ def run_mchmc(log_prob_fn,
         scales = tf.math.reduce_std(initial_state, axis=0)
         if tf.reduce_any(scales == 0):
             raise ValueError("If scales are not provided, they will be estimated from the initial state. However, if any parameter has zero variance across the initial chains, this will lead to zero scales and thus NaNs in the leapfrog updates. Please provide non-zero scales for all parameters either as a tensor of shape (n_params,) or as a scalar which will be broadcasted to all parameters, or ensure that the initial state has non-zero variance across all parameters.")
+    else:
+        if isinstance(scales, (list, np.ndarray)):
+            scales = tf.convert_to_tensor(scales, dtype=tf.float32)
+        if len(scales.shape) == 0:
+            scales = tf.repeat(tf.expand_dims(scales, axis=0), repeats=initial_state.shape[1], axis=0)
+        elif len(scales.shape) == 2 and scales.shape[0] == scales.shape[1]:
+            scales = tf.sqrt(tf.linalg.diag_part(scales))
+        elif len(scales.shape) == 1 and scales.shape[0] == initial_state.shape[1]:
+            pass
+        else:
+            raise ValueError("If scales is a tensor, it must be either a scalar, a vector of shape (n_params,), or a matrix of shape (n_params, n_params) where the square root of the diagonal is taken as the scales.")
 
     dim = initial_state.shape[1]
     n_chains = initial_state.shape[0]
@@ -301,12 +318,16 @@ def run_mchmc(log_prob_fn,
     samples = []
     acceptance_count = tf.zeros(n_chains, dtype=tf.float32)
     log_prob_counter = LogProbCounter(log_prob_fn)
+    log_step_size = tf.Variable(tf.math.log(step_size), dtype=tf.float32)
 
     avg_num_leapfrog = 0.0
-    count_nan_encountered = 0
+    leapfrog_steps_completed = 0
+    leapfrog_steps_completed_burnin = 0
 
     loop_fn = trange if progress_bar else range
-    for i in loop_fn(n_steps):
+
+    total_steps = n_steps + num_burnin_steps
+    for i in loop_fn(total_steps):
         if not progress_bar:
             print("Step", i+1, "of", n_steps, " "*8, end='\r')
 
@@ -324,6 +345,9 @@ def run_mchmc(log_prob_fn,
         q_prop = q0
         p_prop = p0
 
+        # Step size
+        current_step_size = tf.exp(log_step_size)
+
         for t in range(num_leapfrog):
             q_prop_old = q_prop
             p_prop_old = p_prop
@@ -331,15 +355,24 @@ def run_mchmc(log_prob_fn,
                 log_prob_counter,
                 q_prop,
                 p_prop,
-                dt=step_size*scales
+                dt=current_step_size * scales
             )
             if tf.reduce_any(tf.math.is_nan(q_prop)) or tf.reduce_any(tf.math.is_nan(p_prop)):
-                avg_num_leapfrog = (avg_num_leapfrog * count_nan_encountered + t) / (count_nan_encountered + 1)
-                count_nan_encountered += 1
                 # Revert to previous state
                 q_prop = q_prop_old
                 p_prop = p_prop_old
                 break
+            else:
+                if i < num_burnin_steps:
+                    leapfrog_steps_completed_burnin += 1
+                else:
+                    leapfrog_steps_completed += 1
+        # Update average number of leapfrog steps completed so far
+        if i < num_burnin_steps:
+            avg_num_leapfrog = leapfrog_steps_completed_burnin / (i+1)
+        else:
+            avg_num_leapfrog = leapfrog_steps_completed / (i+1-num_burnin_steps)
+        ratio_num_leapfrog = avg_num_leapfrog / num_leapfrog
 
         # Negate momentum for reversibility
         p_prop = -p_prop
@@ -349,6 +382,20 @@ def run_mchmc(log_prob_fn,
 
         # --- Metropolis correction ---
         log_accept_ratio = -(H_prop - H0)
+        accept_prob = tf.minimum(1.0, tf.exp(log_accept_ratio))
+        if i < num_burnin_steps:
+            # Robbins-Monro learning rate
+            t = tf.cast(i + 1, tf.float32)
+            eta = 1.0 / tf.sqrt(t)
+        
+            # Average across chains for stability
+            effective_accept = accept_prob * (
+                (1 - stepsize_adaptation_leapfrog_penalty) + stepsize_adaptation_leapfrog_penalty * ratio_num_leapfrog
+            )
+            mean_effective_accept = tf.reduce_mean(effective_accept)
+        
+            # Update log step size
+            log_step_size.assign_add(eta * (mean_effective_accept - target_accept))
 
         u = tf.math.log(tf.random.uniform([n_chains]))
         accept = u < log_accept_ratio
@@ -360,19 +407,18 @@ def run_mchmc(log_prob_fn,
 
         acceptance_count += accept
 
-        samples.append(q)
+        if i >= num_burnin_steps:
+            samples.append(q)
     if not progress_bar:
         print()
 
-    avg_num_leapfrog = (avg_num_leapfrog * count_nan_encountered + num_leapfrog * (n_steps - count_nan_encountered)) / n_steps
-
-    ratio_num_leapfrog = avg_num_leapfrog / num_leapfrog
-    if ratio_num_leapfrog < 0.6:
+    print("final step size:", tf.exp(log_step_size).numpy())
+    if ratio_num_leapfrog < 0.6 and not ignore_warnings:
         warnings.warn(f"NaNs were encountered significantly often during leapfrog integration in MCHMC. On average, only {avg_num_leapfrog:.2f} out of {num_leapfrog} leapfrog steps were completed before NaNs were encountered. This may indicate that the step size is too large or that the target distribution has regions of very high curvature. Consider reducing the step size or initialising the sampler in a region of higher probability to mitigate this issue.")
 
     samples = tf.stack(samples, axis=0)
     samples = tf.reshape(samples, [n_chains * n_steps, dim])
-    acceptance_rate = acceptance_count / n_steps
+    acceptance_rate = tf.reduce_mean(acceptance_count / total_steps)
     n_evals = log_prob_counter.num_calls
     return samples, acceptance_rate, n_evals
 
@@ -446,7 +492,7 @@ def run_mala(log_prob_fn,
     )
     adaptive_mala = tfp.mcmc.DualAveragingStepSizeAdaptation(
         inner_kernel=wrapped_mala,
-        num_adaptation_steps=int(1.0 * num_burnin_steps),
+        num_adaptation_steps=num_burnin_steps,
         target_accept_prob=0.574,
         step_size_getter_fn=mala_step_size_getter_fn,
         step_size_setter_fn=mala_step_size_setter_fn,
@@ -466,8 +512,8 @@ def run_mala(log_prob_fn,
                                              num_burnin_steps,
                                              pkr.inner_results.inner_results,
                                              num_steps_between_results=num_steps_between_results,
-                                             progress_bar=progress_bar),
-            seed=42)
+                                             progress_bar=progress_bar)
+        )
         samples = samples[num_burnin_steps:]
         return samples, trace
 
