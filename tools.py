@@ -14,6 +14,30 @@ class LogProbCounter:
         self.num_calls.assign_add(1)
         return self.log_prob_fn(*args)
 
+
+def mh_proposal_fn(state, seed, step_size=0.1):
+    flat_state = tf.nest.flatten(state)
+    n = len(flat_state)
+
+    seeds = tf.random.experimental.stateless_split(seed, n)
+
+    flat_next = []
+    for i in range(n):
+
+        s = flat_state[i]
+        seed_i = seeds[i]
+
+        flat_next.append(
+            s + tf.random.stateless_normal(
+                tf.shape(s),
+                seed=seed_i,
+                stddev=step_size
+            )
+        )
+
+    return tf.nest.pack_sequence_as(state, flat_next)
+
+
 MalaResults = namedtuple(
     "MalaResults",
     ["inner_results", "step_size"]

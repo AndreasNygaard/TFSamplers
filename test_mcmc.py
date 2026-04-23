@@ -7,7 +7,7 @@ from load_client_network import load_model_and_scalers
 from run_sampling import Sampler
 
 
-use_gpu = True
+use_gpu = False
 if use_gpu:
     device = '/GPU:0'
 else:
@@ -56,13 +56,13 @@ with tf.device(device):
     s = Sampler(log_prob_lcdm, bounds=(lower_lcdm, upper_lcdm))
     res1 = s.sample(method='affine', n_steps=10000, n_chains=1000, initial_distribution='uniform', sampler_kwargs={'progress_bar':progressbar})
 
-    res2 = s.sample(method='hmc', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=500, sampler_kwargs={'num_burnin_steps': 100, 'progress_bar':progressbar})
+    res2 = s.sample(method='hmc', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=200, sampler_kwargs={'num_burnin_steps': 200, 'progress_bar':progressbar})
 
-    res3 = s.sample(method='nuts', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=500, sampler_kwargs={'num_burnin_steps': 100, 'progress_bar':progressbar})
+    res3 = s.sample(method='nuts', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=200, sampler_kwargs={'num_burnin_steps': 200, 'progress_bar':progressbar})
 
-    res4 = s.sample(method='mchmc', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=500, sampler_kwargs={'num_leapfrog': 10, 'num_burnin_steps': 100, 'progress_bar':progressbar, 'stepsize_adaptation_leapfrog_penalty': 0.2, 'ignore_warnings': True}, burnin_kwargs={'num_leapfrog': 10})
+    res4 = s.sample(method='mh', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=200, sampler_kwargs={'num_burnin_steps': 200, 'progress_bar':progressbar})
 
-    res5 = s.sample(method='mala', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=500, sampler_kwargs={'num_burnin_steps': 500, 'progress_bar':progressbar})
+    res5 = s.sample(method='mala', n_steps=10000, n_chains=1000, initial_state=box_center, initial_distribution='repeat', num_burnin_steps=200, sampler_kwargs={'num_burnin_steps': 200, 'progress_bar':progressbar})
 
 
 #fig = plt.figure(figsize=(25, 25))
@@ -71,12 +71,17 @@ with tf.device(device):
 #figure = corner.corner(res3.samples[-50000:].numpy(), fig=fig, color='C2', levels=(0.68, 0.95))
 #figure = corner.corner(res4.samples[-50000:].numpy(), fig=fig, color='C3', levels=(0.68, 0.95))
 #figure = corner.corner(res5.samples[-50000:].numpy(), fig=fig, color='C4', levels=(0.68, 0.95))
-#plt.savefig('/Users/andreas/Desktop/test_mcmc.pdf')
+#plt.savefig('/Users/andreas/Desktop/test_mcmc_mh.pdf')
 
 
 import pickle as pkl
 
-result_dict = {'res_aies': res1, 'res_hmc': res2, 'res_nuts': res3, 'res_mchmc': res4, 'res_mala': res5}
+result_dict = {'res_aies': res1,
+               'res_hmc': res2,
+               'res_nuts': res3,
+               'res_mh': res4,
+               'res_mala': res5
+               }
 
 with open('test_mcmc_results.pkl', 'wb') as f:
     pkl.dump(result_dict, f)

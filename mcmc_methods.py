@@ -11,7 +11,7 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 tf.get_logger().setLevel('ERROR')
 
-from tools import LogProbCounter, trace_fn, MalaWithStepSize, MalaResults
+from tools import LogProbCounter, trace_fn, mh_proposal_fn, MalaWithStepSize, MalaResults
 
 
 def custom_formatwarning(msg, *args, **kwargs):
@@ -20,12 +20,107 @@ def custom_formatwarning(msg, *args, **kwargs):
 warnings.formatwarning = custom_formatwarning
 
 
+
+### Metropolis-Hastings (MH) ###
+
+def run_mh(log_prob_fn,
+           initial_state,
+           n_steps=1000,
+           covmat=None,
+           step_size=0.1,
+           num_adaptation_steps=None,
+           num_burnin_steps=0,
+           n_chains=10,
+           use_diagonal_covmat=False,
+           progress_bar=True,
+           get_individual_chains=False):
+
+    if isinstance(initial_state, tf.Tensor):
+        if len(initial_state.shape) == 1:
+            initial_state = tf.repeat(tf.expand_dims(initial_state, axis=0), repeats=n_chains, axis=0)
+        elif len(initial_state.shape) > 2:
+            raise ValueError("If initial_state is a tensor, it must have shape (n_chains, n_params) or (n_params,).")
+    else:
+        raise ValueError("initial_state must be a tensor of shape (n_chains, n_params) or (n_params,).")
+
+    n_chains = initial_state.shape[0]
+
+    if covmat is None:
+        scales = tf.math.reduce_std(initial_state, axis=0)
+        if tf.reduce_any(scales == 0):
+            covmat = tf.eye(initial_state.shape[1], dtype=tf.float32)
+            warnings.warn("If covmat is not provided, it will be estimated from the initial state. However, if any parameter has zero variance across the initial chains, an identity covariance matrix will be used instead, which may lead to suboptimal performance. Consider providing a covariance matrix or ensuring that the initial state has non-zero variance across all parameters to mitigate this issue.")
+        else:
+            covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    elif len(covmat.shape) < 2:
+        covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    if use_diagonal_covmat:
+        covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
+    L = tf.linalg.cholesky(covmat)
+
+    def log_prob_whitened(z):
+        x = initial_state + tf.linalg.matvec(L, z)
+        log_det = tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L)))
+        return log_prob_fn(x) + log_det
+
+    log_prob_counter = LogProbCounter(log_prob_whitened)
+
+    step_size = tf.Variable(step_size, dtype=tf.float32)
+
+    def step_size_getter_fn(kernel_results):
+        return step_size
+    def step_size_setter_fn(kernel_results, new_step_size):
+        step_size.assign(new_step_size)
+        return kernel_results
+
+    mh_kernel = tfp.mcmc.RandomWalkMetropolis(
+        target_log_prob_fn=log_prob_counter,
+        new_state_fn=lambda state, seed: mh_proposal_fn(state, seed, step_size=step_size)
+    )
+
+    adaptive_mh = tfp.mcmc.SimpleStepSizeAdaptation(
+        inner_kernel=mh_kernel,
+        num_adaptation_steps=num_burnin_steps,
+        target_accept_prob=0.3,
+        step_size_getter_fn=step_size_getter_fn,
+        step_size_setter_fn=step_size_setter_fn,
+    )
+
+    z0 = tf.zeros_like(initial_state, dtype=tf.float32)
+    @tf.function
+    def run_chain():
+        samples, trace = tfp.mcmc.sample_chain(
+            num_results=n_steps+num_burnin_steps,
+            num_burnin_steps=0,
+            current_state=z0,
+            kernel=adaptive_mh,
+            trace_fn=lambda _, pkr: trace_fn(_,
+                                             pkr,
+                                             n_steps,
+                                             num_burnin_steps,
+                                             pkr.inner_results,
+                                             progress_bar=progress_bar)
+            )
+        samples = samples[num_burnin_steps:]
+        return samples, trace
+    samples, trace = run_chain()
+    print("final step size:", step_size.numpy())
+    x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
+    if not get_individual_chains:
+        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
+    acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
+    n_evals = log_prob_counter.num_calls.numpy()
+    return x_samples, acceptance_rate, n_evals
+
+
+
 ### Affine Invariant Ensemble Sampler (AIES) ###
 
 def run_affine(log_prob_fn,
                initial_state,
                n_steps=1000,
-               progress_bar=True):
+               progress_bar=True,
+               get_individual_chains=False):
 
     if isinstance(initial_state, list):
         if len(initial_state) != 2:
@@ -45,8 +140,9 @@ def run_affine(log_prob_fn,
     log_prob_counter = LogProbCounter(log_prob_fn)
     n_params = initial_state[0].shape[1]
     # run the sampler
-    chain = affine_sample(log_prob_counter, n_steps, initial_state, args=[], progressbar=progress_bar)
-    samples = tf.reshape(chain, [n_steps*n_walkers, n_params])
+    samples = affine_sample(log_prob_counter, n_steps, initial_state, args=[], progressbar=progress_bar)
+    if not get_individual_chains:
+        samples = tf.reshape(samples, [n_steps*n_walkers, n_params])
     acceptance_rate = tf.raw_ops.UniqueV2(x=samples, axis=[0])[0].shape[0]/samples.shape[0]
     n_evals = log_prob_counter.num_calls
     return samples, acceptance_rate, n_evals
@@ -67,7 +163,8 @@ def run_hmc(log_prob_fn,
             num_burnin_steps=0,
             n_chains=10,
             use_diagonal_mass_matrix=False,
-            progress_bar=True):
+            progress_bar=True,
+            get_individual_chains=False):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -127,7 +224,8 @@ def run_hmc(log_prob_fn,
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
+    if not get_individual_chains:
+        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
@@ -147,7 +245,8 @@ def run_nuts(log_prob_fn,
              num_burnin_steps=0,
              n_chains=10,
              use_diagonal_mass_matrix=False,
-             progress_bar=True):
+             progress_bar=True,
+             get_individual_chains=False):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -210,217 +309,11 @@ def run_nuts(log_prob_fn,
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
+    if not get_individual_chains:
+        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
-
-
-
-
-### Microcanonical Hamiltonian Monte Carlo (MCHMC) ###
-
-@tf.function
-def compute_energy_and_gradients(model, q):
-    with tf.GradientTape() as tape:
-        tape.watch(q)
-        logp = model(q)
-        energy = -logp
-    grad = tape.gradient(energy, q)
-    return energy, grad
-
-@tf.function
-def mchmc_step(model, q, p, dt=1e-3):
-    """
-    One microcanonical dynamics step
-    q: position (parameter vector)
-    p: momentum (same shape as q)
-    """
-    # half step p
-    energy, grad = compute_energy_and_gradients(model, q)
-    #tf.debugging.check_numerics(energy, "Energy is NaN")
-    #tf.debugging.check_numerics(grad, "Grad is NaN")
-    p_half = p - 0.5 * dt * grad
-    
-    # full step q
-    q_new = q + dt * p_half
-
-    # new gradient
-    energy_new, grad_new = compute_energy_and_gradients(model, q_new)
-
-    # complete p update
-    p_new = p_half - 0.5 * dt * grad_new
-
-    # compute new kinetic
-    K_new = tf.reduce_sum(p_new * p_new) / 2.0
-    desired_K = tf.reduce_sum(p * p) / 2.0
-    scale = tf.sqrt(desired_K / (K_new + 1e-12))
-    p_new = p_new * scale
-
-    return q_new, p_new, dt*p_half
-
-@tf.function
-def kinetic_energy(p):
-    return 0.5 * tf.reduce_sum(p * p, axis=-1)
-
-@tf.function
-def potential_energy(q, log_prob_fn):
-    return -log_prob_fn(q)  # shape (num_chains,)
-
-@tf.function
-def hamiltonian(q, p, log_prob_fn):
-    return potential_energy(q, log_prob_fn) + kinetic_energy(p)
-
-def run_mchmc(log_prob_fn,
-              initial_state,
-              n_steps=100,
-              scales=None,
-              num_leapfrog=10,
-              step_size=0.1,
-              num_burnin_steps=0,
-              target_accept=0.7,
-              stepsize_adaptation_leapfrog_penalty=0.4,
-              ignore_warnings=False,
-              n_chains=50,
-              progress_bar=True):
-
-    if isinstance(initial_state, tf.Tensor):
-        if len(initial_state.shape) == 1:
-            initial_state = tf.repeat(tf.expand_dims(initial_state, axis=0), repeats=n_chains, axis=0)
-        elif len(initial_state.shape) > 2:
-            raise ValueError("If initial_state is a tensor, it must have shape (n_chains, n_params) or (n_params,).")
-    else:
-        raise ValueError("initial_state must be a tensor of shape (n_chains, n_params) or (n_params,).")
-
-    n_chains = initial_state.shape[0]
-
-    if scales is None:
-        scales = tf.math.reduce_std(initial_state, axis=0)
-        if tf.reduce_any(scales == 0):
-            raise ValueError("If scales are not provided, they will be estimated from the initial state. However, if any parameter has zero variance across the initial chains, this will lead to zero scales and thus NaNs in the leapfrog updates. Please provide non-zero scales for all parameters either as a tensor of shape (n_params,) or as a scalar which will be broadcasted to all parameters, or ensure that the initial state has non-zero variance across all parameters.")
-    else:
-        if isinstance(scales, (list, np.ndarray)):
-            scales = tf.convert_to_tensor(scales, dtype=tf.float32)
-        if len(scales.shape) == 0:
-            scales = tf.repeat(tf.expand_dims(scales, axis=0), repeats=initial_state.shape[1], axis=0)
-        elif len(scales.shape) == 2 and scales.shape[0] == scales.shape[1]:
-            scales = tf.sqrt(tf.linalg.diag_part(scales))
-        elif len(scales.shape) == 1 and scales.shape[0] == initial_state.shape[1]:
-            pass
-        else:
-            raise ValueError("If scales is a tensor, it must be either a scalar, a vector of shape (n_params,), or a matrix of shape (n_params, n_params) where the square root of the diagonal is taken as the scales.")
-
-    dim = initial_state.shape[1]
-    n_chains = initial_state.shape[0]
-
-    q = initial_state
-
-    samples = []
-    acceptance_count = tf.zeros(n_chains, dtype=tf.float32)
-    log_prob_counter = LogProbCounter(log_prob_fn)
-    log_step_size = tf.Variable(tf.math.log(step_size), dtype=tf.float32)
-
-    avg_num_leapfrog = 0.0
-    leapfrog_steps_completed = 0
-    leapfrog_steps_completed_burnin = 0
-
-    loop_fn = trange if progress_bar else range
-
-    total_steps = n_steps + num_burnin_steps
-    for i in loop_fn(total_steps):
-        if not progress_bar:
-            print("Step", i+1, "of", n_steps, " "*8, end='\r')
-
-        # --- Sample fresh momentum ---
-        p = tf.random.normal([n_chains, dim])
-
-        # Save initial state
-        q0 = q
-        p0 = p
-
-        # Initial Hamiltonian
-        H0 = hamiltonian(q0, p0, log_prob_counter)
-
-        # --- Leapfrog trajectory ---
-        q_prop = q0
-        p_prop = p0
-
-        # Step size
-        current_step_size = tf.exp(log_step_size)
-
-        for t in range(num_leapfrog):
-            q_prop_old = q_prop
-            p_prop_old = p_prop
-            q_prop, p_prop, _ = mchmc_step(
-                log_prob_counter,
-                q_prop,
-                p_prop,
-                dt=current_step_size * scales
-            )
-            if tf.reduce_any(tf.math.is_nan(q_prop)) or tf.reduce_any(tf.math.is_nan(p_prop)):
-                # Revert to previous state
-                q_prop = q_prop_old
-                p_prop = p_prop_old
-                break
-            else:
-                if i < num_burnin_steps:
-                    leapfrog_steps_completed_burnin += 1
-                else:
-                    leapfrog_steps_completed += 1
-        # Update average number of leapfrog steps completed so far
-        if i < num_burnin_steps:
-            avg_num_leapfrog = leapfrog_steps_completed_burnin / (i+1)
-        else:
-            avg_num_leapfrog = leapfrog_steps_completed / (i+1-num_burnin_steps)
-        ratio_num_leapfrog = avg_num_leapfrog / num_leapfrog
-
-        # Negate momentum for reversibility
-        p_prop = -p_prop
-
-        # Proposed Hamiltonian
-        H_prop = hamiltonian(q_prop, p_prop, log_prob_counter)
-
-        # --- Metropolis correction ---
-        log_accept_ratio = -(H_prop - H0)
-        accept_prob = tf.minimum(1.0, tf.exp(log_accept_ratio))
-        if i < num_burnin_steps:
-            # Robbins-Monro learning rate
-            t = tf.cast(i + 1, tf.float32)
-            eta = 1.0 / tf.sqrt(t)
-        
-            # Average across chains for stability
-            effective_accept = accept_prob * (
-                (1 - stepsize_adaptation_leapfrog_penalty) + stepsize_adaptation_leapfrog_penalty * ratio_num_leapfrog
-            )
-            mean_effective_accept = tf.reduce_mean(effective_accept)
-        
-            # Update log step size
-            log_step_size.assign_add(eta * (mean_effective_accept - target_accept))
-
-        u = tf.math.log(tf.random.uniform([n_chains]))
-        accept = u < log_accept_ratio
-
-        accept = tf.cast(accept, tf.float32)
-
-        # Update positions (reject -> keep old q)
-        q = tf.where(tf.expand_dims(accept > 0, -1), q_prop, q0)
-
-        acceptance_count += accept
-
-        if i >= num_burnin_steps:
-            samples.append(q)
-    if not progress_bar:
-        print()
-
-    print("final step size:", tf.exp(log_step_size).numpy())
-    if ratio_num_leapfrog < 0.6 and not ignore_warnings:
-        warnings.warn(f"NaNs were encountered significantly often during leapfrog integration in MCHMC. On average, only {avg_num_leapfrog:.2f} out of {num_leapfrog} leapfrog steps were completed before NaNs were encountered. This may indicate that the step size is too large or that the target distribution has regions of very high curvature. Consider reducing the step size or initialising the sampler in a region of higher probability to mitigate this issue.")
-
-    samples = tf.stack(samples, axis=0)
-    samples = tf.reshape(samples, [n_chains * n_steps, dim])
-    acceptance_rate = tf.reduce_mean(acceptance_count / total_steps)
-    n_evals = log_prob_counter.num_calls
-    return samples, acceptance_rate, n_evals
 
 
 
@@ -436,8 +329,9 @@ def run_mala(log_prob_fn,
              num_steps_between_results=0,
              volatility_fn=None,
              n_chains=50,
-             use_diagonal_mass_matrix=False,
-             progress_bar=True):
+             use_diagonal_covmat=False,
+             progress_bar=True,
+             get_individual_chains=False):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -458,7 +352,7 @@ def run_mala(log_prob_fn,
             covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
     elif len(covmat.shape) < 2:
         covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
-    if use_diagonal_mass_matrix:
+    if use_diagonal_covmat:
         covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
     L = tf.linalg.cholesky(covmat)
 
@@ -519,7 +413,8 @@ def run_mala(log_prob_fn,
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
+    if not get_individual_chains:
+        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
     n_evals = log_prob_counter.num_calls.numpy()
     return x_samples, acceptance_rate, n_evals

@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow_probability as tfp
 from hypersphere_sampler import HypersphereSampler
 
-from mcmc_methods import run_affine, run_hmc, run_nuts, run_mchmc, run_mala
+from mcmc_methods import run_mh, run_affine, run_hmc, run_nuts, run_mala
 
 class SamplerResults():
     def __init__(self, samples, acceptance_rate, evaluations):
@@ -15,11 +15,13 @@ class SamplerResults():
         self.burnin_samples = None
         self.burnin_acceptance_rates = None
         self.burnin_evaluations = None
+        self.covmat_estimate = None
 
-    def set_burnin_results(self, burnin_samples, burnin_acceptance_rates, burnin_evaluations):
+    def set_burnin_results(self, burnin_samples, burnin_acceptance_rates, burnin_evaluations, covmat_estimate):
         self.burnin_samples = burnin_samples
         self.burnin_acceptance_rates = burnin_acceptance_rates
         self.burnin_evaluations = burnin_evaluations
+        self.covmat_estimate = covmat_estimate
 
 class Sampler:
     def __init__(self, log_prob_fn, bounds=None, enforce_boundaries=True, covmat=None, initial_state=None, n_chains=10, initial_distribution='repeat'):
@@ -67,7 +69,8 @@ class Sampler:
                update_initial_state=True,
                update_initial_distribution=True,
                sampler_kwargs={},
-               burnin_kwargs={}):
+               burnin_kwargs={},
+               get_individual_chains=False):
 
         if num_covmat_updates > 0 and num_burnin_steps == 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
@@ -76,8 +79,15 @@ class Sampler:
             self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=bounds)
         elif self.initial_state is None:
             raise ValueError("Initial state must be provided either during initialization, when calling sample(), or using the set_initial_state method.")
-            
-        if method == 'affine':
+        sampler_kwargs.update({'get_individual_chains': get_individual_chains})
+
+        if method == 'mh':
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(self.log_prob_fn,
+                                                                                    initial_state,
+                                                                                    n_steps=steps,
+                                                                                    covmat=covmat,
+                                                                                    **sampler_kwargs)
+        elif method == 'affine':
             num_burnin_steps = 0  # Affine-invariant sampler doesn't use burn-in
             num_covmat_updates = 0  # Affine-invariant sampler doesn't update covariance
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_affine(self.log_prob_fn,
@@ -96,12 +106,6 @@ class Sampler:
                                                                                       n_steps=steps,
                                                                                       covmat=covmat,
                                                                                       **sampler_kwargs)
-        elif method == 'mchmc':
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mchmc(self.log_prob_fn,
-                                                                                       initial_state,
-                                                                                       n_steps=steps,
-                                                                                       scales=covmat,
-                                                                                       **sampler_kwargs)
         elif method == 'mala':
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mala(self.log_prob_fn,
                                                                                       initial_state,
@@ -143,7 +147,7 @@ class Sampler:
 
         sampler_results = SamplerResults(samples, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
-            sampler_results.set_burnin_results(burnin_samples, burnin_acceptance_rates, burnin_evaluations)
+            sampler_results.set_burnin_results(burnin_samples, burnin_acceptance_rates, burnin_evaluations, covmat_estimate)
 
         return sampler_results
         
