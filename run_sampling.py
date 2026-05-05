@@ -74,7 +74,7 @@ class Sampler:
                burnin_kwargs={},
                get_individual_chains=True):
 
-        if num_covmat_updates > 0 and num_burnin_steps == 0:
+        if (num_covmat_updates is None or num_covmat_updates > 0) and num_burnin_steps <= 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
 
         if covmat is not None:
@@ -129,7 +129,7 @@ class Sampler:
         burnin_acceptance_rates = []
         burnin_evaluations = []
         for i in range(num_covmat_updates):
-            print(f"Estimatingcovariance matrix, iteration {i+1}/{num_covmat_updates}...")
+            print(f"Estimating covariance matrix, iteration {i+1}/{num_covmat_updates}...")
             samples, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
             combined_samples = tf.reshape(samples, [n_chains * num_burnin_steps, dim])
             if get_individual_chains:
