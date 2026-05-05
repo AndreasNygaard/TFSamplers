@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow_probability as tfp
 from hypersphere_sampler import HypersphereSampler
 
-from mcmc_methods import run_mh, run_affine, run_hmc, run_nuts, run_mala
+from mcmc_methods import run_mh, run_aies, run_hmc, run_nuts, run_mala
 
 class SamplerResults():
     def __init__(self, samples, acceptance_rate, evaluations):
@@ -60,13 +60,13 @@ class Sampler:
     def sample(self,
                initial_state=None,
                n_steps=100,
-               method='affine',
+               method='aies',
                n_chains=10,
                initial_distribution='repeat',
                bounds=None,
                covmat=None,
                num_burnin_steps=100,
-               num_covmat_updates=3,
+               num_covmat_updates=None,
                update_initial_state=True,
                update_initial_distribution=True,
                continue_distribution=False,
@@ -92,12 +92,14 @@ class Sampler:
                                                                                     n_steps=steps,
                                                                                     covmat=covmat,
                                                                                     **sampler_kwargs)
-        elif method == 'affine':
+        elif method == 'aies':
             continue_distribution = True
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_affine(self.log_prob_fn,
-                                                                                        initial_state,
-                                                                                        n_steps=steps,
-                                                                                        **sampler_kwargs)
+            if num_covmat_updates is None:
+                num_covmat_updates = 0
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_aies(self.log_prob_fn,
+                                                                                      initial_state,
+                                                                                      n_steps=steps,
+                                                                                      **sampler_kwargs)
         elif method == 'hmc':
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_hmc(self.log_prob_fn,
                                                                                      initial_state,
@@ -118,6 +120,8 @@ class Sampler:
                                                                                       **sampler_kwargs)
         else:
             raise ValueError("Invalid sampling method. Must be 'affine', 'hmc', 'nuts', 'mchmc', or 'mala'.")
+        if num_covmat_updates is None:
+            num_covmat_updates = 3
         covmat_estimate = self.ini_covmat
         burnin_sampler_kwargs = sampler_kwargs.copy()
         burnin_sampler_kwargs.update(burnin_kwargs)

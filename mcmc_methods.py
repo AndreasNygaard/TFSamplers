@@ -243,11 +243,11 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
     return samples
 
 
-def run_affine(log_prob_fn,
-               initial_state,
-               n_steps=1000,
-               num_burnin_steps=0,
-               progress_bar=True):
+def run_aies(log_prob_fn,
+             initial_state,
+             n_steps=1000,
+             num_burnin_steps=0,
+             progress_bar=True):
 
     if isinstance(initial_state, list):
         if len(initial_state) != 2:
