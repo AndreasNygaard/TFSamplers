@@ -93,6 +93,8 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
         start_time = time.time()
         return 0.0
     else:
+        now_time = time.time()
+        elapsed = now_time - start_time
         step = step // (num_steps_between_results + 1) + 1*int(num_steps_between_results > 0)
 
     step = int(step)
@@ -100,6 +102,7 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     burnin = float(num_burnin_steps)
     total = float(num_samples + num_burnin_steps)
     progress = step / total
+
 
     # --- PERCENT ---
     percent_value = int(progress * 100)
@@ -116,10 +119,8 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     diff_counter = len_total - len_step
     counter = " "*diff_counter + f"{step}/{int(total)}"
 
-    # --- TIME ---
-    elapsed = time.time() - start_time
-    rate = max(step / max(elapsed, 1e-10), 1e-3)
-
+    # --- RATE ---
+    rate = max((step) / max(elapsed, 1e-10), 1e-3)
     eta = (total - step) / rate
 
     # format time as mm:ss
@@ -141,7 +142,7 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     elapsed_str = format_time(elapsed)
     eta_str = format_time(eta)
 
-    # --- RATE ---
+    # --- RATE STRING ---
     rate_value = round(rate * 100) / 100
     rate_str = f"{rate_value:.2f}"
     len_rate = len(rate_str)
@@ -178,18 +179,22 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     return 0.0
 
 
-def trace_fn(_, pkr, num_samples, num_burnin_steps, inner_results, num_steps_between_results=0, progress_bar=True):
-    if progress_bar:
-        tf.py_function(
-            func=lambda step: py_update(step, num_samples, num_burnin_steps, num_steps_between_results),
-            inp=[pkr.step],
-            Tout=tf.float32
-        )
-    else:
-        if pkr.step > 0:
-            tf.print("Step:", pkr.step, "of", num_samples + num_burnin_steps, " "*8, end="\r")
-        if pkr.step == num_samples + num_burnin_steps - 1:
-            tf.print()
+def trace_fn_w_progress_bar(_, pkr, num_samples, num_burnin_steps, inner_results, num_steps_between_results=0):
+    tf.py_function(
+        func=lambda step: py_update(step, num_samples, num_burnin_steps, num_steps_between_results),
+        inp=[pkr.step],
+        Tout=tf.float32
+    )
+
+    return (
+        inner_results.is_accepted,
+    )
+
+def trace_fn_wo_progress_bar(_, pkr, num_samples, num_burnin_steps, inner_results, num_steps_between_results=0):
+    if pkr.step > 0:
+        tf.print("Step:", pkr.step, "of", num_samples + num_burnin_steps, " "*8, end="\r")
+    if pkr.step == num_samples + num_burnin_steps - 1:
+        tf.print()
 
     return (
         inner_results.is_accepted,

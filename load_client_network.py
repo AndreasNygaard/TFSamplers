@@ -4,10 +4,10 @@ import pickle as pkl
 
 from custom_objects import Alsing, CustomTanh, create_msre_loss
 
-def load_model_and_scalers(cosmo_model):
-    model_path = f'/Users/andreas/Documents/Codes/notebooks/likelihood sampling with CLiENT networks/results_it9_20260112/{cosmo_model}/trained_models/trained_model_it_9.keras'
-    x_scaler_path = f'/Users/andreas/Documents/Codes/notebooks/likelihood sampling with CLiENT networks/results_it9_20260112/{cosmo_model}/scalers/x_scaler_it_9.pkl'
-    y_scaler_path = f'/Users/andreas/Documents/Codes/notebooks/likelihood sampling with CLiENT networks/results_it9_20260112/{cosmo_model}/scalers/y_scaler_it_9.pkl'
+def load_model_and_scalers(cosmo_model, root='/home/andreas/codes/TF_sampling'):
+    model_path = f'{root}/results_it9_20260112/{cosmo_model}/trained_models/trained_model_it_9.keras'
+    x_scaler_path = f'{root}/results_it9_20260112/{cosmo_model}/scalers/x_scaler_it_9.pkl'
+    y_scaler_path = f'{root}/results_it9_20260112/{cosmo_model}/scalers/y_scaler_it_9.pkl'
 
     with open(x_scaler_path, 'rb') as f:
         x_scaler = pkl.load(f)

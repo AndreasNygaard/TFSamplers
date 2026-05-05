@@ -68,9 +68,10 @@ class Sampler:
                num_covmat_updates=3,
                update_initial_state=True,
                update_initial_distribution=True,
+               continue_distribution=False,
                sampler_kwargs={},
                burnin_kwargs={},
-               get_individual_chains=False):
+               get_individual_chains=True):
 
         if num_covmat_updates > 0 and num_burnin_steps == 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
@@ -79,7 +80,8 @@ class Sampler:
             self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=bounds)
         elif self.initial_state is None:
             raise ValueError("Initial state must be provided either during initialization, when calling sample(), or using the set_initial_state method.")
-        sampler_kwargs.update({'get_individual_chains': get_individual_chains})
+        n_chains = self.initial_state.shape[0]
+        dim = self.initial_state.shape[1]
 
         if method == 'mh':
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(self.log_prob_fn,
@@ -88,8 +90,7 @@ class Sampler:
                                                                                     covmat=covmat,
                                                                                     **sampler_kwargs)
         elif method == 'affine':
-            num_burnin_steps = 0  # Affine-invariant sampler doesn't use burn-in
-            num_covmat_updates = 0  # Affine-invariant sampler doesn't update covariance
+            continue_distribution = True
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_affine(self.log_prob_fn,
                                                                                         initial_state,
                                                                                         n_steps=steps,
@@ -123,17 +124,26 @@ class Sampler:
         for i in range(num_covmat_updates):
             print(f"Estimatingcovariance matrix, iteration {i+1}/{num_covmat_updates}...")
             samples, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
-            burnin_samples.append(samples)
+            combined_samples = tf.reshape(samples, [n_chains * num_burnin_steps, dim])
+            if get_individual_chains:
+                burnin_samples.append(samples)
+            else:
+                burnin_samples.append(combined_samples)
             burnin_acceptance_rates.append(acceptance_rate)
             burnin_evaluations.append(evaluations)
-            covmat_estimate = tfp.stats.covariance(samples)
-            L = tf.linalg.cholesky(covmat_estimate)
-            covmat_estimate = tf.matmul(L, L, transpose_b=True)  # Ensure covariance matrix is positive definite
-            bestfit_estimate = tf.reduce_mean(samples, axis=0)
-            if tf.math.reduce_any(tf.math.is_nan(covmat_estimate)) or tf.math.reduce_any(tf.math.is_inf(covmat_estimate)):
-                raise ValueError("Covariance matrix estimate contains NaNs or Infs. Use an initial state closer to the mode or use method='affine' instead to get a better initial state and covariance estimate.")
+            if not continue_distribution:
+                covmat_estimate = tfp.stats.covariance(combined_samples)
+                L = tf.linalg.cholesky(covmat_estimate)
+                covmat_estimate = tf.matmul(L, L, transpose_b=True)  # Ensure covariance matrix is positive definite
+                bestfit_estimate = tf.reduce_mean(combined_samples, axis=0)
+                if tf.math.reduce_any(tf.math.is_nan(covmat_estimate)) or tf.math.reduce_any(tf.math.is_inf(covmat_estimate)):
+                    raise ValueError("Covariance matrix estimate contains NaNs or Infs. Use an initial state closer to the mode or use method='affine' instead to get a better initial state and covariance estimate.")
+            else:
+                covmat_estimate = None
 
-            if update_initial_state and initial_distribution != 'uniform' and len(initial_state.shape) == 1:
+            if continue_distribution:
+                self.initial_state = samples[-1,:,:] # set new initial_state to the last state of the previous iteration
+            elif update_initial_state and initial_distribution != 'uniform' and len(initial_state.shape) == 1:
                 if update_initial_distribution:
                     initial_distribution = 'gaussian'
                 self.set_initial_state(bestfit_estimate,
@@ -144,6 +154,8 @@ class Sampler:
 
         print("Running final sampling...")
         samples, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
+        if not get_individual_chains:
+            samples = tf.reshape(samples, [n_chains * n_steps, dim])
 
         sampler_results = SamplerResults(samples, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
@@ -202,7 +214,9 @@ class Sampler:
             if initial_state[0].shape != initial_state[1].shape:
                 raise ValueError("If initial_state is a list of two tensors, both tensors must have the same shape.")
 
-        if isinstance(initial_state, list) or (isinstance(initial_state, tf.Tensor) and len(initial_state.shape) == 2):
+        if isinstance(initial_state, list):
+            initial_state = tf.concat(initial_state, axis=0)
+        elif isinstance(initial_state, tf.Tensor) and len(initial_state.shape) == 2:
             pass
         elif initial_state is None and initial_distribution == 'uniform':
             if bounds is not None:

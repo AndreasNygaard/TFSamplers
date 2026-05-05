@@ -5,13 +5,11 @@ import warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 import numpy as np
-from tqdm import trange
-from affine import affine_sample
 import tensorflow_probability as tfp
 tfd = tfp.distributions
 tf.get_logger().setLevel('ERROR')
 
-from tools import LogProbCounter, trace_fn, mh_proposal_fn, MalaWithStepSize, MalaResults
+from tools import LogProbCounter, py_update, trace_fn_w_progress_bar, trace_fn_wo_progress_bar, mh_proposal_fn, MalaWithStepSize, MalaResults
 
 
 def custom_formatwarning(msg, *args, **kwargs):
@@ -32,8 +30,7 @@ def run_mh(log_prob_fn,
            num_burnin_steps=0,
            n_chains=10,
            use_diagonal_covmat=False,
-           progress_bar=True,
-           get_individual_chains=False):
+           progress_bar=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -54,6 +51,8 @@ def run_mh(log_prob_fn,
             covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
     elif len(covmat.shape) < 2:
         covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    elif len(covmat.shape) > 2:
+        raise ValueError("Covariance matrix must be either 2D, 1D, or scalar")
     if use_diagonal_covmat:
         covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
     L = tf.linalg.cholesky(covmat)
@@ -87,6 +86,12 @@ def run_mh(log_prob_fn,
     )
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
+
+    if progress_bar:
+        trace_fn = trace_fn_w_progress_bar
+    else:
+        trace_fn = trace_fn_wo_progress_bar
+
     @tf.function
     def run_chain():
         samples, trace = tfp.mcmc.sample_chain(
@@ -98,16 +103,13 @@ def run_mh(log_prob_fn,
                                              pkr,
                                              n_steps,
                                              num_burnin_steps,
-                                             pkr.inner_results,
-                                             progress_bar=progress_bar)
+                                             pkr.inner_results,)
             )
         samples = samples[num_burnin_steps:]
         return samples, trace
     samples, trace = run_chain()
     print("final step size:", step_size.numpy())
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    if not get_individual_chains:
-        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
     n_evals = log_prob_counter.num_calls.numpy()
     return x_samples, acceptance_rate, n_evals
@@ -116,11 +118,136 @@ def run_mh(log_prob_fn,
 
 ### Affine Invariant Ensemble Sampler (AIES) ###
 
+def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0, progressbar=True):
+    state1, state2 = current_state
+    n_walkers, n_params = state1.shape
+
+    state1 = tf.convert_to_tensor(state1)
+    state2 = tf.convert_to_tensor(state2)
+
+    logp1 = log_prob(state1)
+    logp2 = log_prob(state2)
+
+    dtype = state1.dtype
+    n_params_m1 = tf.constant(n_params - 1.0, dtype=dtype)
+
+    @tf.function(jit_compile=True)
+    def run_chunk(state1, state2, logp1, logp2, steps):
+
+        chain = tf.TensorArray(
+            dtype=dtype,
+            size=steps,
+            element_shape=tf.TensorShape([2 * n_walkers, n_params]),
+        )
+
+        def body(i, state1, state2, logp1, logp2, chain):
+
+            # --- same sequential update as before ---
+            idx1 = tf.random.uniform([n_walkers], 0, n_walkers, dtype=tf.int32)
+            partner1 = tf.gather(state2, idx1)
+
+            z1 = 0.5 * (1.0 + tf.random.uniform([n_walkers], dtype=dtype)) ** 2
+            z1r = tf.reshape(z1, [-1, 1])
+
+            prop1 = partner1 + z1r * (state1 - partner1)
+            logp_prop1 = log_prob(prop1)
+
+            log_a1 = n_params_m1 * tf.math.log(z1) + (logp_prop1 - logp1)
+            accept1 = tf.math.log(tf.random.uniform([n_walkers], dtype=dtype)) < log_a1
+
+            accept1_f = tf.cast(accept1, dtype)[:, None]
+            new_state1 = state1 * (1.0 - accept1_f) + prop1 * accept1_f
+            new_logp1 = tf.where(accept1, logp_prop1, logp1)
+
+            idx2 = tf.random.uniform([n_walkers], 0, n_walkers, dtype=tf.int32)
+            partner2 = tf.gather(new_state1, idx2)
+
+            z2 = 0.5 * (1.0 + tf.random.uniform([n_walkers], dtype=dtype)) ** 2
+            z2r = tf.reshape(z2, [-1, 1])
+
+            prop2 = partner2 + z2r * (state2 - partner2)
+            logp_prop2 = log_prob(prop2)
+
+            log_a2 = n_params_m1 * tf.math.log(z2) + (logp_prop2 - logp2)
+            accept2 = tf.math.log(tf.random.uniform([n_walkers], dtype=dtype)) < log_a2
+
+            accept2_f = tf.cast(accept2, dtype)[:, None]
+            new_state2 = state2 * (1.0 - accept2_f) + prop2 * accept2_f
+            new_logp2 = tf.where(accept2, logp_prop2, logp2)
+
+            combined = tf.concat([new_state1, new_state2], axis=0)
+
+            return (
+                i + 1,
+                new_state1,
+                new_state2,
+                new_logp1,
+                new_logp2,
+                chain.write(i, combined),
+            )
+
+        _, state1, state2, logp1, logp2, chain = tf.while_loop(
+            lambda i, *_: i < steps,
+            body,
+            loop_vars=[0, state1, state2, logp1, logp2, chain],
+            parallel_iterations=1,
+        )
+
+        return state1, state2, logp1, logp2, chain.stack()
+
+    # -------- Python driver with progress bar --------
+    total_steps = n_steps + num_burnin_steps
+    chunk_size = min(max(1, total_steps // 100), 1000)
+    chunk_remainder = total_steps % chunk_size
+
+    # pre-compilation
+    _ = run_chunk(
+        state1, state2, logp1, logp2, chunk_size
+    )
+    if chunk_remainder > 0:
+        _ = run_chunk(
+            state1, state2, logp1, logp2, chunk_remainder
+        )
+
+    all_chunks = []
+    steps_done = 0
+
+    if progressbar:
+        py_update(
+            0,
+            num_samples=n_steps,
+            num_burnin_steps=num_burnin_steps,
+            num_steps_between_results=0
+        )
+
+    while steps_done < total_steps:
+        steps_this = min(chunk_size, total_steps - steps_done)
+
+        state1, state2, logp1, logp2, chunk = run_chunk(
+            state1, state2, logp1, logp2, steps_this
+        )
+
+        all_chunks.append(chunk)
+        steps_done += steps_this
+
+        if progressbar:
+            py_update(
+                steps_done,
+                num_samples=n_steps,
+                num_burnin_steps=num_burnin_steps,
+                num_steps_between_results=0
+            )
+
+    samples = tf.concat(all_chunks, axis=0)
+    samples = samples[num_burnin_steps:]
+    return samples
+
+
 def run_affine(log_prob_fn,
                initial_state,
                n_steps=1000,
-               progress_bar=True,
-               get_individual_chains=False):
+               num_burnin_steps=0,
+               progress_bar=True):
 
     if isinstance(initial_state, list):
         if len(initial_state) != 2:
@@ -138,11 +265,15 @@ def run_affine(log_prob_fn,
     else:
         raise ValueError("initial_state must be either a tensor of shape (n_walkers, n_params) or a list of two tensors of shape (n_walkers/2, n_params), where n_walkers is even.")
     log_prob_counter = LogProbCounter(log_prob_fn)
+
     n_params = initial_state[0].shape[1]
     # run the sampler
-    samples = affine_sample(log_prob_counter, n_steps, initial_state, args=[], progressbar=progress_bar)
-    if not get_individual_chains:
-        samples = tf.reshape(samples, [n_steps*n_walkers, n_params])
+    samples = aies_sampling(log_prob_counter,
+                            n_steps,
+                            initial_state,
+                            args=[],
+                            num_burnin_steps=num_burnin_steps,
+                            progressbar=progress_bar)
     acceptance_rate = tf.raw_ops.UniqueV2(x=samples, axis=[0])[0].shape[0]/samples.shape[0]
     n_evals = log_prob_counter.num_calls
     return samples, acceptance_rate, n_evals
@@ -163,8 +294,7 @@ def run_hmc(log_prob_fn,
             num_burnin_steps=0,
             n_chains=10,
             use_diagonal_mass_matrix=False,
-            progress_bar=True,
-            get_individual_chains=False):
+            progress_bar=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -175,7 +305,7 @@ def run_hmc(log_prob_fn,
         raise ValueError("initial_state must be a tensor of shape (n_chains, n_params) or (n_params,).")
 
     n_chains = initial_state.shape[0]
-    
+
     if covmat is None:
         scales = tf.math.reduce_std(initial_state, axis=0)
         if tf.reduce_any(scales == 0):
@@ -185,6 +315,8 @@ def run_hmc(log_prob_fn,
             covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
     elif len(covmat.shape) < 2:
         covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    elif len(covmat.shape) > 2:
+        raise ValueError("Covariance matrix must be either 2D, 1D, or scalar")
     if use_diagonal_mass_matrix:
         covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
     L = tf.linalg.cholesky(covmat)
@@ -207,25 +339,26 @@ def run_hmc(log_prob_fn,
     )
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
-    # Run the chain (with burn-in).
+
+    if progress_bar:
+        trace_fn = trace_fn_w_progress_bar
+    else:
+        trace_fn = trace_fn_wo_progress_bar
+
     @tf.function
     def run_chain():
-        # Run the chain (with burn-in). 
-        # Implements MCMC via repeated TransitionKernel steps.
         samples, trace = tfp.mcmc.sample_chain(
             num_results=n_steps+num_burnin_steps,
             num_burnin_steps=0,
             current_state=z0,
             kernel=adaptive_hmc,
-            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results, progress_bar=progress_bar)
+            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results)
         )
         samples = samples[num_burnin_steps:]
         return samples, trace
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    if not get_individual_chains:
-        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
@@ -245,8 +378,7 @@ def run_nuts(log_prob_fn,
              num_burnin_steps=0,
              n_chains=10,
              use_diagonal_mass_matrix=False,
-             progress_bar=True,
-             get_individual_chains=False):
+             progress_bar=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -267,6 +399,8 @@ def run_nuts(log_prob_fn,
             covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
     elif len(covmat.shape) < 2:
         covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    elif len(covmat.shape) > 2:
+        raise ValueError("Covariance matrix must be either 2D, 1D, or scalar")
     if use_diagonal_mass_matrix:
         covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
     L = tf.linalg.cholesky(covmat)
@@ -275,7 +409,7 @@ def run_nuts(log_prob_fn,
         x = initial_state + tf.linalg.matvec(L, z)
         log_det = tf.reduce_sum(tf.math.log(tf.linalg.diag_part(L)))
         return log_prob_fn(x) + log_det
-    
+
     log_prob_counter = LogProbCounter(log_prob_whitened)
 
     nuts = tfp.mcmc.NoUTurnSampler(
@@ -292,25 +426,25 @@ def run_nuts(log_prob_fn,
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
 
-    # Run the chain (with burn-in).
+    if progress_bar:
+        trace_fn = trace_fn_w_progress_bar
+    else:
+        trace_fn = trace_fn_wo_progress_bar
+
     @tf.function
     def run_chain():
-        # Run the chain (with burn-in). 
-        # Implements MCMC via repeated TransitionKernel steps.
         samples, trace = tfp.mcmc.sample_chain(
             num_results=n_steps+num_burnin_steps,
             num_burnin_steps=0,
             current_state=z0,
             kernel=nuts,
-            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results, progress_bar=progress_bar)
+            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results)
             )
         samples = samples[num_burnin_steps:]
         return samples, trace
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    if not get_individual_chains:
-        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
@@ -330,8 +464,7 @@ def run_mala(log_prob_fn,
              volatility_fn=None,
              n_chains=50,
              use_diagonal_covmat=False,
-             progress_bar=True,
-             get_individual_chains=False):
+             progress_bar=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -352,6 +485,8 @@ def run_mala(log_prob_fn,
             covmat = tf.power(scales,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
     elif len(covmat.shape) < 2:
         covmat = tf.power(covmat,2) * tf.eye(initial_state.shape[1], dtype=tf.float32)
+    elif len(covmat.shape) > 2:
+        raise ValueError("Covariance matrix must be either 2D, 1D, or scalar")
     if use_diagonal_covmat:
         covmat = tf.linalg.diag(tf.linalg.diag_part(covmat))
     L = tf.linalg.cholesky(covmat)
@@ -362,7 +497,7 @@ def run_mala(log_prob_fn,
         return log_prob_fn(x) + log_det
 
     log_prob_counter = LogProbCounter(log_prob_whitened)
-    
+
     if volatility_fn is None:
         def volatility_fn(x):
             return 1. / (0.5 + 0.1 * tf.math.abs(x))
@@ -371,7 +506,6 @@ def run_mala(log_prob_fn,
 
     def mala_step_size_getter_fn(kernel_results):
         return kernel_results.step_size
-
 
     def mala_step_size_setter_fn(kernel_results, new_step_size):
         return MalaResults(
@@ -392,6 +526,11 @@ def run_mala(log_prob_fn,
         step_size_setter_fn=mala_step_size_setter_fn,
     )
 
+    if progress_bar:
+        trace_fn = trace_fn_w_progress_bar
+    else:
+        trace_fn = trace_fn_wo_progress_bar
+
     @tf.function
     def run_chain():
         samples, trace = tfp.mcmc.sample_chain(
@@ -405,16 +544,13 @@ def run_mala(log_prob_fn,
                                              n_steps,
                                              num_burnin_steps,
                                              pkr.inner_results.inner_results,
-                                             num_steps_between_results=num_steps_between_results,
-                                             progress_bar=progress_bar)
+                                             num_steps_between_results=num_steps_between_results)
         )
         samples = samples[num_burnin_steps:]
         return samples, trace
 
     samples, trace = run_chain()
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    if not get_individual_chains:
-        x_samples = tf.reshape(x_samples, [n_chains * n_steps, initial_state.shape[1]])
     acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
     n_evals = log_prob_counter.num_calls.numpy()
     return x_samples, acceptance_rate, n_evals
