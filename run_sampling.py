@@ -119,7 +119,7 @@ class Sampler:
                                                                                       covmat=covmat,
                                                                                       **sampler_kwargs)
         else:
-            raise ValueError("Invalid sampling method. Must be 'affine', 'hmc', 'nuts', 'mchmc', or 'mala'.")
+            raise ValueError("Invalid sampling method. Must be 'mh', 'aies', 'hmc', 'nuts', or 'mala'.")
         if num_covmat_updates is None:
             num_covmat_updates = 3
         covmat_estimate = self.ini_covmat
