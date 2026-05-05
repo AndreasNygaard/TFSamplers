@@ -64,6 +64,7 @@ class Sampler:
                n_chains=10,
                initial_distribution='repeat',
                bounds=None,
+               covmat=None,
                num_burnin_steps=100,
                num_covmat_updates=3,
                update_initial_state=True,
@@ -76,6 +77,8 @@ class Sampler:
         if num_covmat_updates > 0 and num_burnin_steps == 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
 
+        if covmat is not None:
+            self.set_covmat(covmat)
         if initial_state is not None or initial_distribution == 'uniform':
             self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=bounds)
         elif self.initial_state is None:
