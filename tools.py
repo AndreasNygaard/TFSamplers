@@ -15,6 +15,119 @@ class LogProbCounter:
         return self.log_prob_fn(*args)
 
 
+def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_bar=True, inner_level=1, jit_compile=True):
+    kernel_results = kernel.bootstrap_results(current_state)
+
+    @tf.function(jit_compile=jit_compile)
+    def run_chunk1(current_state, kernel_results, num_steps):
+        states = tf.TensorArray(current_state.dtype, size=num_steps)
+        accepts = tf.TensorArray(tf.bool, size=num_steps)
+
+        def body(i, state, results, states, accepts):
+            next_state, next_results = kernel.one_step(state, results)
+
+            states = states.write(i, next_state)
+            accepts = accepts.write(i, next_results.inner_results.is_accepted)
+
+            return i + 1, next_state, next_results, states, accepts
+
+        _, state, results, states, accepts = tf.while_loop(
+            lambda i, *_: i < num_steps,
+            loop_vars=[0, current_state, kernel_results, states, accepts],
+            body=body,
+            parallel_iterations=1,
+        )
+
+        return state, results, states.stack(), accepts.stack()
+
+    @tf.function(jit_compile=jit_compile)
+    def run_chunk2(current_state, kernel_results, num_steps):
+        states = tf.TensorArray(current_state.dtype, size=num_steps)
+        accepts = tf.TensorArray(tf.bool, size=num_steps)
+
+        def body(i, state, results, states, accepts):
+            next_state, next_results = kernel.one_step(state, results)
+
+            states = states.write(i, next_state)
+            accepts = accepts.write(i, next_results.inner_results.inner_results.is_accepted)
+
+            return i + 1, next_state, next_results, states, accepts
+
+        _, state, results, states, accepts = tf.while_loop(
+            lambda i, *_: i < num_steps,
+            loop_vars=[0, current_state, kernel_results, states, accepts],
+            body=body,
+            parallel_iterations=1,
+        )
+
+        return state, results, states.stack(), accepts.stack()
+
+    if inner_level == 1:
+        run_chunk = run_chunk1
+    elif inner_level == 2:
+        run_chunk = run_chunk2
+    else:
+        raise NotImplementedError("Using more than 2 nested kernels is not supported.")
+
+    total_steps = n_steps + num_burnin_steps
+    chunk_size = min(max(1, total_steps // 100), 1000)
+    chunk_remainder = total_steps % chunk_size
+
+    # pre-compilation
+    _, res, _, _ = run_chunk(
+        current_state, kernel_results, chunk_size
+    )
+    _, res, _, _ = run_chunk(
+        current_state, res, chunk_size
+    )
+    if chunk_remainder > 0:
+        _, res, _, _ = run_chunk(
+            current_state, res, chunk_remainder
+        )
+
+    samples_list = []
+    accepts_list = []
+
+    steps_done = 0
+
+    if progress_bar:
+        py_update(
+            0,
+            num_samples=n_steps,
+            num_burnin_steps=num_burnin_steps,
+            num_steps_between_results=0
+        )
+
+    while steps_done < total_steps:
+        steps_this = min(chunk_size, total_steps - steps_done)
+        current_state, kernel_results, chunk_states, accepts = run_chunk(
+            current_state,
+            kernel_results,
+            steps_this
+        )
+
+        samples_list.append(chunk_states)
+        accepts_list.append(accepts)
+
+        steps_done += steps_this
+
+        if progress_bar:
+            py_update(
+                steps_done,
+                num_samples=n_steps,
+                num_burnin_steps=num_burnin_steps,
+                num_steps_between_results=0
+            )
+
+    samples = tf.concat(samples_list, axis=0)
+    samples = samples[num_burnin_steps:]
+
+    accepts = tf.concat(accepts_list, axis=0)
+    accepts = accepts[num_burnin_steps:]
+
+    acceptance_rate = tf.reduce_mean(tf.cast(accepts, tf.float32))
+    return samples, acceptance_rate
+
 def mh_proposal_fn(state, seed, step_size=0.1):
     flat_state = tf.nest.flatten(state)
     n = len(flat_state)

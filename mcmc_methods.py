@@ -9,7 +9,7 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 tf.get_logger().setLevel('ERROR')
 
-from tools import LogProbCounter, py_update, trace_fn_w_progress_bar, trace_fn_wo_progress_bar, mh_proposal_fn, MalaWithStepSize, MalaResults
+from tools import LogProbCounter, py_update, trace_fn_w_progress_bar, trace_fn_wo_progress_bar, mh_proposal_fn, MalaWithStepSize, MalaResults, jit_tfp_sample
 
 
 def custom_formatwarning(msg, *args, **kwargs):
@@ -18,6 +18,19 @@ def custom_formatwarning(msg, *args, **kwargs):
 warnings.formatwarning = custom_formatwarning
 
 
+### Nested sampler ###
+
+from nested import NestedSamplerTF
+
+def run_nested(log_prob_fn,
+               initial_state,
+               n_steps=1000,
+               covmat=None,
+               mean=None,
+               jit_compile=True):
+    NS = NestedSamplerTF(log_prob_fn, covmat, mean=mean, jit_compile=jit_compile)
+    output = NS.run(initial_state, n_iter=n_steps)
+    return output
 
 ### Metropolis-Hastings (MH) ###
 
@@ -30,7 +43,8 @@ def run_mh(log_prob_fn,
            num_burnin_steps=0,
            n_chains=10,
            use_diagonal_covmat=False,
-           progress_bar=True):
+           progress_bar=True,
+           jit_compile=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -92,33 +106,17 @@ def run_mh(log_prob_fn,
     else:
         trace_fn = trace_fn_wo_progress_bar
 
-    @tf.function
-    def run_chain():
-        samples, trace = tfp.mcmc.sample_chain(
-            num_results=n_steps+num_burnin_steps,
-            num_burnin_steps=0,
-            current_state=z0,
-            kernel=adaptive_mh,
-            trace_fn=lambda _, pkr: trace_fn(_,
-                                             pkr,
-                                             n_steps,
-                                             num_burnin_steps,
-                                             pkr.inner_results,)
-            )
-        samples = samples[num_burnin_steps:]
-        return samples, trace
-    samples, trace = run_chain()
-    print("final step size:", step_size.numpy())
+    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mh, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
-    n_evals = log_prob_counter.num_calls.numpy()
+    n_evals = log_prob_counter.num_calls
+
     return x_samples, acceptance_rate, n_evals
 
 
 
 ### Affine Invariant Ensemble Sampler (AIES) ###
 
-def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0, progressbar=True):
+def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0, progressbar=True, jit_compile=True):
     state1, state2 = current_state
     n_walkers, n_params = state1.shape
 
@@ -131,7 +129,7 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
     dtype = state1.dtype
     n_params_m1 = tf.constant(n_params - 1.0, dtype=dtype)
 
-    @tf.function(jit_compile=True)
+    @tf.function(jit_compile=jit_compile)
     def run_chunk(state1, state2, logp1, logp2, steps):
 
         chain = tf.TensorArray(
@@ -247,7 +245,8 @@ def run_aies(log_prob_fn,
              initial_state,
              n_steps=1000,
              num_burnin_steps=0,
-             progress_bar=True):
+             progress_bar=True,
+             jit_compile=True):
 
     if isinstance(initial_state, list):
         if len(initial_state) != 2:
@@ -273,7 +272,8 @@ def run_aies(log_prob_fn,
                             initial_state,
                             args=[],
                             num_burnin_steps=num_burnin_steps,
-                            progressbar=progress_bar)
+                            progressbar=progress_bar,
+                            jit_compile=jit_compile)
     acceptance_rate = tf.raw_ops.UniqueV2(x=samples, axis=[0])[0].shape[0]/samples.shape[0]
     n_evals = log_prob_counter.num_calls
     return samples, acceptance_rate, n_evals
@@ -294,7 +294,8 @@ def run_hmc(log_prob_fn,
             num_burnin_steps=0,
             n_chains=10,
             use_diagonal_mass_matrix=False,
-            progress_bar=True):
+            progress_bar=True,
+            jit_compile=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -345,21 +346,8 @@ def run_hmc(log_prob_fn,
     else:
         trace_fn = trace_fn_wo_progress_bar
 
-    @tf.function
-    def run_chain():
-        samples, trace = tfp.mcmc.sample_chain(
-            num_results=n_steps+num_burnin_steps,
-            num_burnin_steps=0,
-            current_state=z0,
-            kernel=adaptive_hmc,
-            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results)
-        )
-        samples = samples[num_burnin_steps:]
-        return samples, trace
-
-    samples, trace = run_chain()
+    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_hmc, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
 
@@ -378,7 +366,8 @@ def run_nuts(log_prob_fn,
              num_burnin_steps=0,
              n_chains=10,
              use_diagonal_mass_matrix=False,
-             progress_bar=True):
+             progress_bar=True,
+             jit_compile=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -418,7 +407,7 @@ def run_nuts(log_prob_fn,
         max_tree_depth=max_tree_depth,
     )
 
-    nuts = tfp.mcmc.DualAveragingStepSizeAdaptation(
+    adaptive_nuts = tfp.mcmc.DualAveragingStepSizeAdaptation(
         nuts,
         num_adaptation_steps=num_burnin_steps if num_adaptation_steps is None else num_adaptation_steps,
         target_accept_prob=target_accept_prob
@@ -431,21 +420,8 @@ def run_nuts(log_prob_fn,
     else:
         trace_fn = trace_fn_wo_progress_bar
 
-    @tf.function
-    def run_chain():
-        samples, trace = tfp.mcmc.sample_chain(
-            num_results=n_steps+num_burnin_steps,
-            num_burnin_steps=0,
-            current_state=z0,
-            kernel=nuts,
-            trace_fn=lambda _, pkr: trace_fn(_, pkr, n_steps, num_burnin_steps, pkr.inner_results)
-            )
-        samples = samples[num_burnin_steps:]
-        return samples, trace
-
-    samples, trace = run_chain()
+    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_nuts, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32))
     n_evals = log_prob_counter.num_calls
     return x_samples, acceptance_rate, n_evals
 
@@ -464,7 +440,8 @@ def run_mala(log_prob_fn,
              volatility_fn=None,
              n_chains=50,
              use_diagonal_covmat=False,
-             progress_bar=True):
+             progress_bar=True,
+             jit_compile=True):
 
     if isinstance(initial_state, tf.Tensor):
         if len(initial_state.shape) == 1:
@@ -531,26 +508,7 @@ def run_mala(log_prob_fn,
     else:
         trace_fn = trace_fn_wo_progress_bar
 
-    @tf.function
-    def run_chain():
-        samples, trace = tfp.mcmc.sample_chain(
-            num_results=n_steps+num_burnin_steps,
-            current_state=z0,
-            kernel=adaptive_mala,
-            num_burnin_steps=0,
-            num_steps_between_results=num_steps_between_results,
-            trace_fn=lambda _, pkr: trace_fn(_,
-                                             pkr,
-                                             n_steps,
-                                             num_burnin_steps,
-                                             pkr.inner_results.inner_results,
-                                             num_steps_between_results=num_steps_between_results)
-        )
-        samples = samples[num_burnin_steps:]
-        return samples, trace
-
-    samples, trace = run_chain()
+    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mala, progress_bar=progress_bar, inner_level=2, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
-    acceptance_rate = tf.reduce_mean(tf.cast(trace[0], tf.float32)).numpy()
     n_evals = log_prob_counter.num_calls.numpy()
     return x_samples, acceptance_rate, n_evals

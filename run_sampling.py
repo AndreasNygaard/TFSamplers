@@ -5,7 +5,7 @@ import numpy as np
 import tensorflow_probability as tfp
 from hypersphere_sampler import HypersphereSampler
 
-from mcmc_methods import run_mh, run_aies, run_hmc, run_nuts, run_mala
+from mcmc_methods import run_mh, run_aies, run_hmc, run_nuts, run_mala, run_nested
 
 class SamplerResults():
     def __init__(self, samples, acceptance_rate, evaluations):
@@ -43,14 +43,7 @@ class Sampler:
             self.log_prob_fn = log_prob_fn
 
         if covmat is not None:
-            if isinstance(covmat, list):
-                covmat = tf.convert_to_tensor(covmat, dtype=tf.float32)
-            if len(covmat.shape) == 1:
-                self.ini_covmat = tf.linalg.diag(covmat**2)
-            elif len(covmat.shape) == 2:
-                self.ini_covmat = covmat
-            else:
-                raise ValueError("Covariance matrix must be either a 1D array (diagonal) or a 2D array (full covariance).")
+            self.set_covmat(covmat)
         elif bounds is not None:
             self.ini_covmat = tf.linalg.diag((self.upper_bounds - self.lower_bounds) / 1000.0)**2
         else:
@@ -72,19 +65,25 @@ class Sampler:
                continue_distribution=False,
                sampler_kwargs={},
                burnin_kwargs={},
-               get_individual_chains=True):
+               get_individual_chains=True,
+               jit_compile=True):
 
         if (num_covmat_updates is None or num_covmat_updates > 0) and num_burnin_steps <= 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
 
         if covmat is not None:
-            self.set_covmat(covmat)
+            covmat_estimate = self.format_covmat(covmat)
+        else:
+            covmat_estimate = self.ini_covmat
         if initial_state is not None or initial_distribution == 'uniform':
             self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=bounds)
         elif self.initial_state is None:
             raise ValueError("Initial state must be provided either during initialization, when calling sample(), or using the set_initial_state method.")
         n_chains = self.initial_state.shape[0]
         dim = self.initial_state.shape[1]
+
+        if 'jit_compile' not in sampler_kwargs:
+            sampler_kwargs.update({'jit_compile': jit_compile})
 
         if method == 'mh':
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(self.log_prob_fn,
@@ -118,11 +117,17 @@ class Sampler:
                                                                                       n_steps=steps,
                                                                                       covmat=covmat,
                                                                                       **sampler_kwargs)
+        elif method == 'nested':
+            num_covmat_updates = 0
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_nested(self.log_prob_fn,
+                                                                                        initial_state,
+                                                                                        n_steps=steps,
+                                                                                        covmat=covmat,
+                                                                                        **sampler_kwargs)
         else:
             raise ValueError("Invalid sampling method. Must be 'mh', 'aies', 'hmc', 'nuts', or 'mala'.")
         if num_covmat_updates is None:
             num_covmat_updates = 3
-        covmat_estimate = self.ini_covmat
         burnin_sampler_kwargs = sampler_kwargs.copy()
         burnin_sampler_kwargs.update(burnin_kwargs)
         burnin_samples = []
@@ -190,15 +195,19 @@ class Sampler:
 
         return bounded_log_prob_fn
 
-    def set_covmat(self, covmat):
+    def format_covmat(self, covmat):
         if isinstance(covmat, list):
             covmat = tf.convert_to_tensor(covmat, dtype=tf.float32)
         if len(covmat.shape) == 1:
-            self.ini_covmat = tf.linalg.diag(covmat)
+            new_covmat = tf.linalg.diag(covmat)
         elif len(covmat.shape) == 2:
-            self.ini_covmat = covmat
+            new_covmat = covmat
         else:
             raise ValueError("Covariance matrix must be either a 1D array (diagonal) or a 2D array (full covariance).")
+        return new_covmat
+
+    def set_covmat(self, covmat):
+        self.ini_covmat = self.format_covmat(covmat)
 
     def set_bounds(self, lower_bounds, upper_bounds, overwrite_covmat=False, overwrite_log_prob_fn=True):
         if isinstance(lower_bounds, list):
